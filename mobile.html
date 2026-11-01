@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+<script src="date-dmy.js"></script><script src="caps-input.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Mobile Approvals Panel</title>
+
+    <!-- Prevents the login screen from flashing: with a token in localStorage the overlay is never painted. Must run first. -->
+    <script src="sso-preboot.js"></script>
+
+    <!-- The login window now lives only on launcher.html. Without a token
+         this page redirects there before it opens, so nobody sees the
+         mobile app's own role/PIN gate. See sso-gate.js. -->
+    <script src="sso-gate.js"></script>
+    <script>if(typeof SARV_GATE!=="undefined")SARV_GATE.requireSession();else console.error("[SARV] sso-gate.js did not load. Keep that file in the same folder as the apps.");</script>
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+    <!-- Stamps the GM / MD signature onto the Store Inward / Outward PDF STORE.html already uploaded. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+
+    <!-- Build stamp: see the note on mobile-core.js at the end of the page. -->
+    <link rel="stylesheet" href="mobile.css?v=20261031d">
+</head>
+<body>
+
+<div class="app-container">
+    <div class="modal-overlay" id="loginScreen" style="display:flex; align-items:center;">
+        <div class="modal-content">
+            <div class="modal-title"><span>Approver Login</span></div>
+
+            <!-- ── Login by name (one name + one PIN for all apps) ──────
+                 This is the main path: the ERP, Complaint, Packing and this
+                 app all run on ONE `app_users` row. Picking a name shows
+                 that person's roles, and after login the other apps open
+                 without asking for the PIN again (a single session is
+                 created). The older "Approving As" path below is kept for
+                 people whose name is not yet in the Admin Panel. -->
+            <div class="form-group">
+                <label>Your Name <small style="font-weight:500;color:#6b7280;">One PIN for all apps</small></label>
+                <input type="text" id="loginName" class="form-select" list="loginNamesDl"
+                       autocomplete="off" placeholder="Type or pick your name">
+                <datalist id="loginNamesDl"></datalist>
+                <div id="loginNameRoles" style="font-size:0.7rem;font-weight:700;color:#166534;margin-top:4px;min-height:14px;"></div>
+            </div>
+
+            <div id="loginRoleWrap">
+                <div style="display:flex;align-items:center;gap:8px;margin:12px 0 10px;">
+                    <span style="flex:1;height:1px;background:#e5e7eb;"></span>
+                    <span style="font-size:0.68rem;color:#9ca3af;font-weight:700;">or the old way</span>
+                    <span style="flex:1;height:1px;background:#e5e7eb;"></span>
+                </div>
+                <div class="form-group">
+                    <label>Approving As</label>
+                    <select id="loginRole" class="form-select">
+                        <option value="">-- Select Role --</option>
+                        <option value="gm">GM</option>
+                        <option value="md">MD</option>
+                        <option value="purchaser">Purchaser</option>
+                        <option value="poSender">PO Sender</option>
+                    </select>
+                </div>
+            <div class="form-group" id="loginVendorGroup" style="display:none;">
+                <label>Vendor Name</label>
+                <select id="loginVendor" class="form-select">
+                    <option value="">-- Select Vendor --</option>
+                </select>
+            </div>
+            <!-- Fixed list — the same names as STORE.html's PR form "Purchaser
+                 Name" dropdown — so it opens instantly instead of waiting on a
+                 server lookup. Each purchaser's PIN is still checked on login;
+                 an Admin sets PINs in STORE.html > Settings > Change Passwords. -->
+            <div class="form-group" id="loginPurchaserGroup" style="display:none;">
+                <label>Purchaser Name</label>
+                <select id="loginPurchaser" class="form-select">
+                    <option value="">-- Select Purchaser --</option>
+                    <option value="KHUSHBOO">KHUSHBOO</option>
+                    <option value="SATINDER JI">SATINDER JI</option>
+                    <option value="ANKUR JI">ANKUR JI</option>
+                    <option value="PARKASH JI">PARKASH JI</option>
+                    <option value="DEEPAK VERMA">DEEPAK VERMA</option>
+                    <option value="PRIYA VERMA">PRIYA VERMA</option>
+                    <option value="FIELD BOY">FIELD BOY</option>
+                </select>
+            </div>
+            </div><!-- /loginRoleWrap -->
+            <div class="form-group">
+                <label>PIN</label>
+                <input type="password" id="loginPin" class="form-select" placeholder="Enter PIN" inputmode="numeric" autocomplete="off">
+            </div>
+            <div class="err-banner" id="loginError"></div>
+            <button class="btn" id="loginBtn">Unlock</button>
+        </div>
+    </div>
+
+    <div id="busyOverlay"><div></div><div id="busyText">Working...</div></div>
+
+    <header>
+        <!-- The + sits right next to the title because raising a requirement is
+             the one thing on this screen that STARTS work rather than clearing
+             it; everything else in the bar (search, role) acts on the list
+             below. Hidden until somebody is logged in — see syncNewPrBtn(). -->
+        <span style="display:flex;align-items:center;gap:8px;min-width:0;">
+            <span>Approval Dashboard</span>
+            <span id="newPrBtn" onclick="openMobilePrForm()" style="display:none;"
+                  title="Fill a new PERSONNEL ITEM REQUIREMENT FORM">+ New PR</span>
+        </span>
+        <span style="display:flex;align-items:center;gap:8px;">
+            <span id="searchToggle" onclick="toggleSearchBar()" title="Search">Search</span>
+            <span id="roleBadge" onclick="logoutRole()">-</span>
+        </span>
+    </header>
+
+    <!-- One search bar for PR no. / PO no. / Supplier / Vendor, plus a chip
+         that narrows a PR list down to the ones Vendor Info is filled on. -->
+    <div id="searchBar">
+        <div style="display:flex;align-items:center;gap:8px;">
+            <input type="search" id="searchInput" placeholder="PR No. / PO No. / Supplier..." autocomplete="off">
+            <span id="searchClear" onclick="clearSearch()" title="Clear">&#10006;</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:7px;flex-wrap:wrap;">
+            <span id="searchCount"></span>
+            <!-- Live status: says whether the list is updating itself, so nobody
+                 is left wondering whether what they are looking at is current.
+                 Tap to force a refresh now. -->
+            <span id="liveStatus" title="The list updates on its own. Tap to refresh now."
+                  style="margin-left:auto;font-size:0.68rem;font-weight:700;color:#166534;background:#dcfce7;border:1px solid #86efac;border-radius:12px;padding:2px 9px;cursor:pointer;white-space:nowrap;display:none;">
+                <span id="liveDot" style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#16a34a;vertical-align:middle;margin-right:5px;"></span><span id="liveText">Live</span>
+            </span>
+        </div>
+    </div>
+
+    <!-- Four stage tabs, the same for every role. Each shows the work waiting
+         at that stage; the role that does that stage's work can act on it,
+         everyone else sees it read-only. See STAGE_TABS in the script. -->
+    <nav class="stage-tabs" id="stageTabs">
+        <div class="stage-tab" data-tab="VI" onclick="switchStageTab('VI')">
+            <span class="st-ico"></span><span class="st-lbl">Vendor Info</span><span class="st-count" id="cnt-VI">0</span>
+        </div>
+        <div class="stage-tab" data-tab="POGEN" onclick="switchStageTab('POGEN')">
+            <span class="st-ico"></span><span class="st-lbl">PO Generate</span><span class="st-count" id="cnt-POGEN">0</span>
+        </div>
+        <div class="stage-tab" data-tab="MD" onclick="switchStageTab('MD')">
+            <span class="st-ico"></span><span class="st-lbl">MD Approval</span><span class="st-count" id="cnt-MD">0</span>
+        </div>
+        <div class="stage-tab" data-tab="SENT" onclick="switchStageTab('SENT')">
+            <span class="st-ico"></span><span class="st-lbl">PO Sent to Vendor</span><span class="st-count" id="cnt-SENT">0</span>
+        </div>
+        <!-- GM and MD: Store entries (Inward / Inward NB / Outward) to be
+             checked against their items. GM checks first, then the same entry
+             surfaces for MD. See STORE_STAGES. -->
+        <div class="stage-tab" data-tab="STORE" onclick="switchStageTab('STORE')">
+            <span class="st-ico"></span><span class="st-lbl">Store Check</span><span class="st-count" id="cnt-STORE">0</span>
+        </div>
+        <!-- Purchaser: what has actually arrived against the POs raised from
+             their own PRs, split Pending / Partially Received / Received. -->
+        <div class="stage-tab" data-tab="RECV" onclick="switchStageTab('RECV')">
+            <span class="st-ico"></span><span class="st-lbl">PO Receipts</span><span class="st-count" id="cnt-RECV">0</span>
+        </div>
+        <!-- PO Sender: the POs already WITH the vendor whose material has not
+             fully arrived. Each follow-up call is recorded as the revised date
+             the vendor promised plus what they said — see FOLLOWUP in
+             STAGE_TABS. The whole history surfaces in STORE.html's Follow-Up
+             Report, in the column right after PO Sent to Vendor. -->
+        <div class="stage-tab" data-tab="FOLLOWUP" onclick="switchStageTab('FOLLOWUP')">
+            <span class="st-ico"></span><span class="st-lbl">PO Follow-up</span><span class="st-count" id="cnt-FOLLOWUP">0</span>
+        </div>
+    </nav>
+    <div class="sub-bar">
+        <!-- Buttons are rebuilt per tab — PO Receipts has three sections, the
+             rest have two. See VIEWS_FOR_TAB / syncStageTabsUi. -->
+        <div class="seg" id="viewSeg"></div>
+        <span id="accessNote" class="access-note"></span>
+    </div>
+
+    <!-- Store Check sub-tabs: which document type the list shows. A second row
+         rather than more buttons in the bar above, because the two are different
+         questions — which document type, and which section of it — and stacking
+         them in one strip would read as a single eight-way choice. The number on
+         each chip is how many cards tapping it puts on screen, i.e. it already
+         accounts for the Pending / Complete section above. See
+         STORE_TYPE_TABS / renderStoreTypeSeg. -->
+    <div class="sub-bar store-type-bar" id="storeTypeBar" style="display:none;">
+        <div class="seg" id="storeTypeSeg"></div>
+    </div>
+
+    <div class="list-container" id="list"></div>
+
+    <div class="modal-overlay" id="approvalModal">
+        <div class="modal-content">
+            <div class="modal-title">
+                <span id="modal-header-title">Approval Details</span>
+                <button class="close-btn" onclick="closeModal()">×</button>
+            </div>
+
+            <div class="req-meta-info" id="modal-meta-info"></div>
+
+            <!-- ── MD Rejection Remark ──────────────────────────────────
+                 Why a PO raised off this PR came back. High up, directly under
+                 the header, because it is the reason this record is open at all
+                 — reading it is what has to happen before anything else on the
+                 screen makes sense. On a PR it lists every rejected PO raised
+                 from it (a split PR can have more than one, each sent back for
+                 its own reason); on a PO it is that PO's own rejection.
+                 Filled by renderMdRejectionNote(); hidden on everything else. -->
+            <div id="mdRejectNote" class="md-reject-note" style="display:none;"></div>
+
+            <label style="font-size: 0.85rem; font-weight: 600; margin-bottom: 6px; display: block;">Item Details</label>
+            <!-- FIELD BOY only: how many items the requester has approved, with
+                 the photo / waiting / sent-back counts underneath. See
+                 fbRenderBar in mobile-core.js. -->
+            <div id="fbChecklistBar" style="display:none; margin-bottom:8px; border:1px solid #bbf7d0; background:#f0fdf4; border-radius:8px; padding:8px 10px;">
+                <div id="fbChecklistText" style="font-size:0.78rem; font-weight:800; color:#166534;"></div>
+                <div style="height:6px; background:#dcfce7; border-radius:4px; margin-top:6px; overflow:hidden;">
+                    <div id="fbChecklistFill" style="height:100%; width:0%; background:#16a34a; transition:width .2s;"></div>
+                </div>
+                <div id="fbChecklistNote" style="font-size:0.68rem; color:#15803d; margin-top:5px; font-weight:600;"></div>
+            </div>
+            <div class="table-container">
+                <table class="item-table">
+                    <thead>
+                        <tr>
+                            <th id="done-col-header" style="display:none;" title="Tick an item (it needs a photo first) to send it for approval">&#10004;</th>
+                            <th id="photo-col-header" style="display:none;" title="Photo of the item bought: required for every item">Photo</th>
+                            <th>Sr</th>
+                            <th>Item Name</th>
+                            <th>Description</th>
+                            <th>Category</th>
+                            <th>Make</th>
+                            <th>Qty/UOM</th>
+                            <th>Weight</th>
+                            <th id="rate-col-header" style="display:none;">Rate</th>
+                            <th id="disc-col-header" style="display:none;">Disc%</th>
+                            <th id="vendor-col-header" style="display:none;">Vendor</th>
+                            <th id="gst-col-header" style="display:none;" title="GST % for this item on the PO — editable while generating the PO">GST%</th>
+                            <th id="basis-col-header" style="display:none;" title="Amount kis par bane — Qty par ya Gross Weight par">Bill On</th>
+                            <th id="amt-col-header" style="display:none;" title="Net rate (rate − disc%) × Qty or Weight. This is the PO line amount.">Amount</th>
+                        </tr>
+                    </thead>
+                    <tbody id="modal-item-tbody">
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- FIELD BOY only: send the ticked items to the person who raised
+                 the PR, or close the PR once they have approved every item. -->
+            <div id="fbActionBar" style="display:none; margin:4px 0 12px; border:1px solid #bfdbfe; background:#eff6ff; border-radius:8px; padding:10px 12px;">
+                <div id="fbActionHint" style="font-size:0.74rem; color:#1e3a8a; font-weight:600; margin-bottom:8px;"></div>
+                <button class="btn" id="fbSendBtn" onclick="fbSend()" style="background:#2563eb;" disabled>Send for Approval</button>
+                <button class="btn" id="fbConfirmBtn" onclick="fbConfirm()" style="background:#16a34a; display:none;">&#10004; Confirm &amp; move to Done</button>
+            </div>
+
+            <!-- Vendor Rate & Info — the same V1..V3 quote grid as STORE.html's
+                 popup, laid out for a phone. Only shown at the PR GM/CEO stage,
+                 which is where a Purchaser signs. Saving it fills the Approved
+                 Vendor dropdown below. -->
+            <div id="vendorInfoPanel" style="display:none; margin-bottom:12px; border:1px solid #d7dde5; border-radius:8px; overflow:hidden;">
+                <div id="vendorInfoToggle" style="display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 12px; background:#fff7e6; cursor:pointer; font-weight:700; font-size:0.85rem;">
+                    <span>Vendor Rate &amp; Info</span>
+                    <span id="vendorInfoChevron">&#9662;</span>
+                </div>
+                <div id="vendorInfoBody" style="display:none; padding:10px 12px; background:#fff;">
+                    <div style="font-size:0.72rem; color:#6b7280; margin-bottom:8px;">
+                        Choose vendors, fill in each item's rate / discount, Bill On and GST%, complete the PO Details below, then tap Save.
+                        Choose each item's Approved Vendor in the Selected Vendor column of the grid, then sign.
+                    </div>
+                    <!-- Shown once quotes are saved: this form is one-shot from a phone. -->
+                    <div id="viLockedNote" style="display:none; background:#fff7e6; border:1px solid #fcd34d; border-radius:6px; padding:8px 10px; margin-bottom:8px; font-size:0.72rem; color:#92400e; font-weight:600;">
+                        Vendor info and PO details are saved. They can now be changed only from the Vendor Rate &amp; Info popup in <b>STORE.html</b> (desktop).
+                        You can still change each item's <b>Selected Vendor</b> in the grid and sign.
+                    </div>
+                    <!-- Add Supplier sits ON this grid because this is where the
+                         gap is found: the vendor pickers only offer Supplier
+                         Master, so a shop that was never entered used to mean
+                         abandoning a half-filled quote sheet and going to a
+                         desktop. The new name lands in every picker on the grid
+                         the moment it is saved — see saveNewSupplierMobile. -->
+                    <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin:10px 0 4px;">
+                        <label style="font-size:0.8rem; font-weight:600; margin:0;">Vendor &amp; Item Rates</label>
+                        <button type="button" id="viAddSupplierBtn"
+                                style="border:1px solid #16a34a; background:#f0fdf4; color:#15803d; font-size:0.72rem; font-weight:800; border-radius:6px; padding:5px 10px; cursor:pointer; white-space:nowrap;"
+                                title="Add a new supplier to the Supplier Master. It appears in every vendor dropdown below immediately.">Add Supplier</button>
+                    </div>
+                    <div style="font-size:0.68rem; color:#6b7280; margin-bottom:6px;">
+                        The contact number is shown in the vendor dropdown. The item column and header are frozen; scroll sideways to see the other vendors.
+                    </div>
+                    <!-- ONE table, not a vendor list plus a rate table. Each
+                         picker is the header of its own Rate / % pair, so a
+                         figure is never read against the wrong vendor. Remarks
+                         has no input any more and Email / Contact are taken
+                         from Supplier Master on save — see saveVendorInfoMobile. -->
+                    <div class="table-container vi-grid-wrap">
+                        <table class="item-table vi-grid" id="viRateTable">
+                            <colgroup id="viRateCols"></colgroup>
+                            <thead>
+                                <tr id="viVendorHead"></tr>
+                                <tr id="viRateHead"></tr>
+                            </thead>
+                            <tbody id="viRateBody"></tbody>
+                        </table>
+                    </div>
+                    <!-- PO terms that belong WITH the quotes ─────────────
+                         Delivery Date, the PO charges and the PO's own notes
+                         used to be asked for in the PO Generate tab, i.e.
+                         after this sheet was closed. They are part of what is
+                         negotiated with the vendor, so they are filled here,
+                         in the same pass as the rates, and PO Generate shows
+                         them back locked. -->
+                    <!-- PO Details: one block PER SELECTED VENDOR ───────
+                         A PR produces as many POs as it has distinct vendors
+                         (autoGeneratePosFromPr groups by vendor). So Delivery
+                         Date, charges and notes are per PO, not per PR, and
+                         each block has that vendor's own PO Calculation right
+                         below it. renderViPoBlocks() builds these blocks and
+                         rebuilds them when the Selected Vendor column changes. -->
+                    <div id="viPoBlocks"></div>
+
+                    <div class="err-banner" id="viError" style="display:none;"></div>
+                    <button class="btn" id="viSaveBtn" style="margin-top:10px;">Save Vendor Info &amp; PO Details</button>
+                </div>
+            </div>
+
+            <!-- ── PO totals ────────────────────────────────────────────
+                 The six figures the PO carries, computed from exactly what
+                 autoGeneratePosFromPr will write: per-line net rate x billed
+                 units, each line's own GST, charges at their own GST. Live
+                 under the grid while quoting, read-only in PO Generate. -->
+            <!-- Read-only calculation for the PO Generate tab: one card per
+                 vendor, the same cards the quote sheet shows. The quote sheet
+                 places its cards inside #viPoBlocks, each under its own PO
+                 Details block. -->
+            <div id="poSummaryWrap"></div>
+
+            <!-- Saved PO terms, shown back in the PO Generate tab. Locked by
+                 design: they were agreed with the vendor at quoting time, and
+                 the editable copies live in the Vendor Rate & Info panel. -->
+            <div class="po-locked-card" id="poLockedCard" style="display:none;">
+                <div class="po-locked-head">PO Details (saved in Vendor Info &mdash; locked)</div>
+                <div class="po-locked-grid" id="poLockedGrid"></div>
+            </div>
+
+            <!-- The Purchaser's other two calls on a PR, sitting right under the
+                 Vendor Rate & Info toggle because they are what you reach for
+                 INSTEAD of chasing quotes: send the PR back (Reject) or park it
+                 (Hold) until whatever is unclear is settled. Only in the Vendor
+                 Info tab — PO Generate has the sign / approve flow instead.
+                 A reason is compulsory for both; the PR's own Remarks box lives
+                 in the approval section, which is hidden at this stage. -->
+            <div id="viDecisionBar" style="display:none; margin-bottom:12px; border:1px solid #d7dde5; border-radius:8px; padding:10px 12px; background:#fcfcfd;">
+                <div id="viHoldNote" style="display:none; background:#fff7e6; border:1px solid #fcd34d; border-radius:6px; padding:8px 10px; margin-bottom:8px; font-size:0.74rem; color:#92400e; font-weight:600;"></div>
+                <label style="font-size:0.8rem; font-weight:600; display:block; margin-bottom:4px;">
+                    Reason / Remarks <span style="color:#dc3545;">*</span>
+                </label>
+                <textarea id="viDecisionRemarks" rows="2" placeholder="Reason for Reject or Hold..." style="width:100%;"></textarea>
+                <div style="display:flex; gap:8px; margin-top:8px;">
+                    <button class="btn" id="viRejectBtn" style="flex:1; width:auto; background:#dc3545;">&#10006; Reject PR</button>
+                    <button class="btn" id="viHoldBtn" style="flex:1; width:auto; background:#d97706;">Hold</button>
+                </div>
+                <div style="font-size:0.7rem; color:#6b7280; margin-top:6px;">
+                    <b>Reject</b>: the PR goes back to Store to be corrected and resubmitted.
+                    <b>Hold</b>: the PR stays here and no PO is created; you can remove the hold any time.
+                </div>
+            </div>
+
+            <div class="req-meta-info" id="approvedVendorInfo" style="display:none;"></div>
+
+            <!-- Why there is nothing to sign here: read-only view, or the
+                 Vendor Info step (approval happens in the PO Generate tab). -->
+            <div class="mode-note" id="modalModeNote" style="display:none;"></div>
+
+            <div id="approvalSection">
+            <div class="form-group" id="deliveryDateGroup" style="display:none;">
+                <label>Delivery Date <span style="color:#dc3545;">*</span></label>
+                <input type="date" id="deliveryDateInput" class="form-select">
+                <div id="deliveryDateHint" style="display:none; font-size:0.72rem; color:#6b7280; margin-top:4px;">
+                    On approval, a PO is created for every approved vendor with this Delivery Date and sent straight for MD approval.
+                </div>
+            </div>
+
+            <!-- PO charges — the LEGACY copy. These are filled on the Vendor
+                 Rate & Info sheet now, per vendor (#viPoBlocks), so this group
+                 only appears for a PR that
+                 reached PO Generate before that sheet existed and therefore has
+                 no saved poPlan to show. Kept, rather than deleted, because
+                 such a PR would otherwise have no way to carry charges at all.
+                 Same fields as STORE.html's Build PO. -->
+            <div class="form-group" id="poChargesGroup" style="display:none;">
+                <label>PO Charges (&#8377;) <small style="font-weight:500;color:#6b7280;">— optional</small></label>
+                <div style="display:grid; grid-template-columns:1fr 1fr 74px; gap:6px;">
+                    <div>
+                        <div style="font-size:0.68rem;color:#6b7280;font-weight:600;margin-bottom:2px;">Freight</div>
+                        <input type="number" id="poFreightInput" class="form-select" min="0" step="0.01" placeholder="0" inputmode="decimal">
+                    </div>
+                    <div>
+                        <div style="font-size:0.68rem;color:#6b7280;font-weight:600;margin-bottom:2px;">Loading / Other Exp.</div>
+                        <input type="number" id="poOtherExpInput" class="form-select" min="0" step="0.01" placeholder="0" inputmode="decimal">
+                    </div>
+                    <div>
+                        <div style="font-size:0.68rem;color:#6b7280;font-weight:600;margin-bottom:2px;">GST %</div>
+                        <input type="number" id="poChargesGstInput" class="form-select" min="0" max="100" step="0.01" value="18" inputmode="decimal" title="GST % on Freight + Loading / Other Exp.">
+                    </div>
+                </div>
+                <div style="font-size:0.7rem; color:#6b7280; margin-top:4px;">
+                    These charges are added to the PO total (GST % applies to them separately). If items are spread across vendors, the charges go on the first PO.
+                </div>
+            </div>
+
+            <!-- ── MD: reasons for rejection ───────────────────────────
+                 MD only (PR or PO). The ticked reasons are saved with the
+                 rejection and printed ahead of the remark wherever it is read
+                 back, so the Purchaser sees at a glance WHAT to recheck. With
+                 at least one tick the remark is optional. Shown / reset in
+                 openModal; read by mdRejectReasons_() in rejectEntry. -->
+            <div class="form-group md-reasons" id="mdReasonGroup" style="display:none;">
+                <label>Reason for Rejection <small style="font-weight:500;color:#6b7280;">tick all that apply</small></label>
+                <div class="md-reasons-grid" id="mdReasonList">
+                    <label><input type="checkbox" value="Review Qty"> Review Qty</label>
+                    <label><input type="checkbox" value="Review Rate"> Review Rate</label>
+                    <label><input type="checkbox" value="Review GST"> Review GST</label>
+                    <label><input type="checkbox" value="Review Freight"> Review Freight</label>
+                    <label><input type="checkbox" value="Review Vendor"> Review Vendor</label>
+                    <label><input type="checkbox" value="Review Bill Basis"> Review Bill Basis</label>
+                    <label><input type="checkbox" value="Review Item Names"> Review Item Names</label>
+                    <label><input type="checkbox" value="Cancel Purchaser Requirement"> Cancel Purchaser Requirement</label>
+                </div>
+            </div>
+
+            <!-- The APPROVAL's remarks, which ride on the signature. Not the
+                 same thing as PO Remarks / Notes (filled on the quote sheet and
+                 printed on the PO) — relabelled in openModal where both are on
+                 screen, so the two are never mistaken for each other. -->
+            <div class="form-group">
+                <label id="remarksLabel">Remarks / Notes</label>
+                <textarea id="remarksInput" rows="2" placeholder="Enter remarks (optional)..."></textarea>
+                <div id="remarksHint" style="display:none; font-size:0.7rem; color:#6b7280; margin-top:4px;">
+                    This is recorded with your signature. Notes to be printed on the PO are under PO Details in <b>Vendor Info</b>.
+                </div>
+            </div>
+
+            <!-- Shown instead of the pad once this user's sign is saved — see applySignPadMode(). -->
+            <div id="pinOnlyNote" style="display:none; margin-bottom:12px; padding:10px 12px; border:1px solid #c4b5fd; background:#f5f3ff; border-radius:8px; font-size:0.8rem; color:#5b21b6; font-weight:700;">
+                Your signature is saved. Tap <b>Approve &amp; Sign</b> and enter your PIN; the saved signature is added to the PDF automatically.
+            </div>
+            <div class="form-group" id="sigPadGroup">
+                <label>
+                    <span>Signature Pad</span>
+                    <span style="display:flex; gap:6px; align-items:center;">
+                        <!-- Draw once (STORE.html → Admin Panel → Users & Roles), then
+                             just the PIN here puts that saved signature on the pad. -->
+                        <button type="button" class="clear-btn" id="pinSignBtn" style="background:#ede9fe; color:#5b21b6; border-color:#a78bfa;">PIN se Sign</button>
+                        <button class="clear-btn" onclick="clearSignature()">Clear</button>
+                    </span>
+                </label>
+                <div class="signature-pad-container">
+                    <canvas id="sigPad"></canvas>
+                </div>
+                <!-- Approve stays disabled until the pad carries ink — syncApproveBtn(). -->
+                <div id="sigRequiredHint" style="margin-top:6px; font-size:12px; color:#5b21b6; font-weight:600;">Tap Approve &amp; Sign. Your saved signature is placed here once you enter your PIN. (If you have no saved signature, sign here.)</div>
+            </div>
+
+            <div style="display:flex; gap:8px;">
+                <button class="btn" id="approveBtn" onclick="approveEntry()" style="flex:1; width:auto;" disabled>✔ Approve & Sign</button>
+                <button class="btn" id="rejectBtn" onclick="rejectEntry()" style="flex:1; width:auto; background:#dc3545;">✖ Reject</button>
+            </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Store Check / PO Receipts modal ──────────────────────────────
+         Kept apart from the approval modal above on purpose. That one is built
+         entirely around a PR / PO and its signature pad; a store entry has
+         neither an approval chain nor a signature, and a PO receipt is a
+         read-only tally. Threading two more record shapes through openModal
+         would mean a branch at nearly every line of it. -->
+    <div class="modal-overlay" id="storeModal">
+        <div class="modal-content">
+            <div class="modal-title">
+                <span id="storeModalTitle">Entry Details</span>
+                <button class="close-btn" onclick="closeStoreModal()">×</button>
+            </div>
+            <div class="req-meta-info" id="storeModalMeta"></div>
+            <!-- Every document behind this entry: its own PDF, plus the PO and
+                 PR it was raised against. Filled on open — see storeModalDocs_. -->
+            <div id="storeModalDocs" style="display:none; margin:8px 0 4px; border:1px solid #d7dde5; border-radius:8px; padding:8px 10px; background:#fbfcfe;">
+                <div style="font-size:0.78rem; font-weight:700; color:#334155; margin-bottom:2px;">Documents</div>
+                <div id="storeModalDocsBody" style="font-size:0.78rem;"></div>
+            </div>
+            <label style="font-size:0.85rem; font-weight:600; margin:8px 0 6px; display:block;">Item Details</label>
+            <div class="table-container">
+                <table class="item-table">
+                    <thead><tr id="storeModalHead"></tr></thead>
+                    <tbody id="storeModalBody"></tbody>
+                </table>
+            </div>
+            <div class="mode-note" id="storeModalNote" style="display:none;"></div>
+            <!-- GM / MD only. One button, no signature: this is a physical
+                 verification of what the store wrote down, not an approval. -->
+            <div id="storeCheckBox" style="display:none; margin-top:12px;">
+                <div class="form-group">
+                    <label>Remarks <small style="font-weight:500;color:#6b7280;">— optional</small></label>
+                    <textarea id="storeCheckRemarks" rows="2" placeholder="Add a note if needed..."></textarea>
+                </div>
+                <button class="btn" id="storeCheckBtn" style="background:#16a34a;">&#10004; Check Done</button>
+            </div>
+            <!-- ── Inward Approval decision (MD) ──────────────────
+                 Shown only for an inward_approvals request opened from the
+                 PO Receipts ▸ Inward Approval sub-tab. Unlike the GM / MD
+                 check above, this one BLOCKS something: STORE.html will not
+                 save the receipt until Approve is pressed here, so there are
+                 two buttons and a reason box that Reject insists on. -->
+            <div id="inwAppBox" style="display:none; margin-top:12px;">
+                <div id="inwAppReasons" style="background:#fff7ed; border:1px solid #fed7aa; border-radius:8px; padding:9px 11px; margin-bottom:10px; font-size:0.76rem; color:#9a3412;"></div>
+                <div class="form-group">
+                    <label>Remarks <small style="font-weight:500;color:#6b7280;">Required for Reject</small></label>
+                    <textarea id="inwAppRemarks" rows="2" placeholder="Reason for Approve or Reject..."></textarea>
+                </div>
+                <div style="display:flex; gap:8px;">
+                    <button class="btn" id="inwAppApproveBtn" style="flex:1; width:auto; background:#16a34a;">&#10004; Approve</button>
+                    <button class="btn" id="inwAppRejectBtn" style="flex:1; width:auto; background:#dc3545;">&#10006; Reject</button>
+                </div>
+                <div style="font-size:0.7rem; color:#6b7280; margin-top:7px;">
+                    <b>Approve</b>: Store can submit the same entry again and save it.
+                    <b>Reject</b>: Store must correct the values; the Inward cannot be saved until then.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── PO Follow-up ─────────────────────────────────────────────────
+         One PO, its whole chase history, and the box that adds the next
+         entry. Its own modal rather than a branch of the approval one: a
+         follow-up has no signature, no approval chain and no item grid — it
+         is an append-only log of what the vendor promised and when.
+
+         The history is ABOVE the input on purpose. The first thing a PO
+         Sender needs before ringing a vendor is what that vendor said last
+         time; a form that opens empty invites the same question to be asked
+         twice. Nothing here is editable once saved — a promise that was made
+         and missed is exactly what this record exists to show, so entries
+         are never rewritten, only added to.
+
+         Revised Date does NOT touch purchase_orders.delivery_date: the PO
+         the vendor holds still says what it said, and the follow-up is the
+         story of what happened after. See savePoFollowup. -->
+    <div class="modal-overlay" id="poFollowupModal">
+        <div class="modal-content">
+            <div class="modal-title">
+                <span id="pfuTitle">PO Follow-up</span>
+                <button class="close-btn" onclick="closePoFollowupModal()">×</button>
+            </div>
+
+            <div class="req-meta-info" id="pfuMeta"></div>
+
+            <!-- Where the order actually stands — the figure the vendor gets
+                 asked about. Filled from the PO's own lines where they loaded. -->
+            <div id="pfuPending" class="pfu-pending" style="display:none;"></div>
+
+            <!-- ── Item Details, PO-wise ────────────────────────────
+                 The same per-item Ordered / Received / Pending table PO
+                 Receipts shows (openRecvModal), because it answers the
+                 question this whole tab is built around: not "is something
+                 outstanding" but WHICH items are, and how much of each. That
+                 is what gets said on the call: "2 of the 3 items on your PO
+                 are still pending, 40 kg" is a conversation; "material is
+                 pending" is not.
+
+                 ABOVE the history and the input deliberately: you read the
+                 shortfall, then the last thing the vendor said about it, then
+                 you write down what they say now. -->
+            <label style="font-size:0.85rem; font-weight:600; margin:10px 0 6px; display:block;">
+                Item Details <span id="pfuItemCount" style="font-weight:800;color:#0284c7;"></span>
+            </label>
+            <div class="table-container">
+                <table class="item-table">
+                    <thead><tr id="pfuItemHead"></tr></thead>
+                    <tbody id="pfuItemBody"></tbody>
+                </table>
+            </div>
+
+            <label style="font-size:0.85rem; font-weight:600; margin:14px 0 6px; display:block;">
+                Follow-up History <span id="pfuCount" style="font-weight:800;color:#0284c7;"></span>
+            </label>
+            <div id="pfuHistory"></div>
+
+            <!-- Add box. Hidden outright for a read-only login — see
+                 openPoFollowupModal; a disabled form would only invite a tap. -->
+            <div id="pfuAddBox">
+                <div class="pfu-add-head">New Follow-up</div>
+                <div class="form-group">
+                    <label>Revised Delivery Date <span style="color:#dc3545;">*</span></label>
+                    <input type="date" id="pfuRevisedDate" class="form-select" autocomplete="off">
+                    <div class="pfu-hint" id="pfuDateHint">Enter the new date the vendor has given. The PO's original Delivery Date does not change; it stays on record as it is.</div>
+                </div>
+                <div class="form-group">
+                    <label>Remarks <span style="color:#dc3545;">*</span></label>
+                    <textarea id="pfuRemarks" rows="3" placeholder="What the vendor said: reason, contact name, how much material is ready..."></textarea>
+                    <div class="pfu-hint">An entry cannot be edited after it is saved; add a new entry instead.</div>
+                </div>
+                <div class="err-banner" id="pfuError"></div>
+                <button class="btn" id="pfuSaveBtn" style="background:#0284c7;">Save Follow-up</button>
+            </div>
+            <div class="mode-note" id="pfuModeNote" style="display:none;"></div>
+        </div>
+    </div>
+
+    <!-- ── PO Sender PIN gate ───────────────────────────────────────────
+         Sending a PO is the one step on this screen that leaves the building:
+         the vendor has the document and the card flips to Sent. The login PIN
+         may have been typed hours ago on a phone that has stayed unlocked
+         since, so the PO Sender re-enters it for each send. Checked on the
+         server by the same verify_role_pin RPC the login uses — no PIN or hash
+         ever reaches this page. -->
+    <div class="modal-overlay" id="poSendPinModal">
+        <div class="modal-content">
+            <div class="modal-title">
+                <span>PO Sender PIN</span>
+                <button class="close-btn" onclick="closePoSendPinGate()">×</button>
+            </div>
+            <div class="req-meta-info" id="poSendPinSubtitle" style="font-weight:700;"></div>
+            <div style="font-size:0.76rem; color:#6b7280; margin:8px 0 10px;">
+                Enter your <b>PO Sender PIN</b> before sending the PO to the vendor. It is the same PIN you use to log in.
+            </div>
+            <div class="form-group">
+                <label>PIN <span style="color:#dc3545;">*</span></label>
+                <input type="password" id="poSendPin" class="form-select" placeholder="Enter PO Sender PIN" inputmode="numeric" autocomplete="off">
+            </div>
+            <div class="err-banner" id="poSendPinError"></div>
+            <div style="display:flex; gap:8px;">
+                <button class="btn" id="poSendPinBtn" style="flex:1; width:auto; background:#25d366;">&#10004; Verify &amp; Send</button>
+                <button class="btn" id="poSendPinCancelBtn" style="flex:1; width:auto; background:#6c757d;">&#10006; Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Sign with PIN ────────────────────────────────────────────────
+         Opens over the approval modal. The signature the user drew once in
+         STORE.html (Admin Panel → Users & Roles) comes back from
+         get_user_signature() only for the right PIN, and is drawn on the pad. -->
+    <div class="modal-overlay" id="pinSignModal" style="z-index:1100;">
+        <div class="modal-content">
+            <div class="modal-title">
+                <span id="pinSignTitle">PIN se Sign</span>
+                <button class="close-btn" onclick="closePinSign()">×</button>
+            </div>
+            <div id="pinSignNote" style="font-size:0.76rem; color:#6b7280; margin-bottom:10px;">
+                Enter your PIN instead of drawing; your saved signature will be placed on the pad.
+            </div>
+            <div class="form-group">
+                <label>User</label>
+                <select id="pinSignUser" class="form-select"></select>
+            </div>
+            <div class="form-group">
+                <label>PIN <span style="color:#dc3545;">*</span></label>
+                <input type="password" id="pinSignPin" class="form-select" placeholder="Enter PIN" inputmode="numeric" autocomplete="off">
+            </div>
+            <div class="err-banner" id="pinSignError"></div>
+            <div style="display:flex; gap:8px;">
+                <button class="btn" id="pinSignOkBtn" style="flex:1; width:auto; background:#16a34a;">Sign</button>
+                <button class="btn" style="flex:1; width:auto; background:#6c757d;" onclick="closePinSign()">&#10006; Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── FIELD BOY item photo ─────────────────────────────────────────
+         The photo is shown first and saved only on Confirm upload, so a
+         blurred or wrong shot can be retaken before it reaches the item row.
+         Opens over the approval modal. See fbPhotoChosen / fbConfirmPhoto. -->
+    <input type="file" id="fbPhotoInput" accept="image/*" capture="environment" style="display:none;" onchange="fbPhotoChosen(this)">
+    <div class="modal-overlay" id="fbPhotoModal" style="z-index:1100;">
+        <div class="modal-content">
+            <div class="modal-title">
+                <span>Item Photo</span>
+                <button class="close-btn" onclick="fbClosePhoto()">×</button>
+            </div>
+            <div id="fbPhotoItem" class="req-meta-info" style="font-weight:700;"></div>
+            <img id="fbPhotoPreview" alt="" style="display:block; max-width:100%; max-height:55vh; margin:8px auto; border-radius:8px; border:1px solid #e2e8f0;">
+            <div class="err-banner" id="fbPhotoError" style="display:block; min-height:0;"></div>
+            <div style="display:flex; gap:8px;">
+                <button class="btn" id="fbPhotoOkBtn" onclick="fbConfirmPhoto()" style="flex:1; width:auto; background:#16a34a;">Confirm upload</button>
+                <button class="btn" onclick="document.getElementById('fbPhotoInput').click()" style="flex:1; width:auto; background:#6c757d;">Retake</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Add Supplier (from the Vendor Rate & Info grid) ──────────────
+         Writes the same `suppliers` row STORE.html's Supplier Master form
+         writes, so a vendor added here is the same record on both screens.
+         Its own small modal rather than a row of prompts: a phone number and
+         a GST number typed into prompt() are impossible to correct, and the
+         vendor dropdowns need the phone (it rides in every option label). -->
+    <!-- Opens ON TOP of the approval modal that holds the quote grid, so the
+         z-index is raised rather than left to DOM order. -->
+    <div class="modal-overlay" id="addSupplierModal" style="z-index:1100;">
+        <div class="modal-content">
+            <div class="modal-title">
+                <span>Add Supplier</span>
+                <button class="close-btn" onclick="closeAddSupplierModal()">×</button>
+            </div>
+            <div style="font-size:0.74rem; color:#6b7280; margin-bottom:10px;">
+                It is saved to the Supplier Master and appears in every vendor dropdown above immediately.
+            </div>
+            <div class="form-group">
+                <label>Supplier Name <span style="color:#dc3545;">*</span></label>
+                <input type="text" id="asName" class="form-select" placeholder="M/s ..." autocomplete="off" style="text-transform:uppercase;">
+            </div>
+            <div class="form-group">
+                <label>Contact No. <small style="font-weight:500;color:#6b7280;">Shown in the dropdown</small></label>
+                <input type="tel" id="asPhone" class="form-select" placeholder="98xxxxxxxx" inputmode="tel" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>Contact Person</label>
+                <input type="text" id="asContact" class="form-select" placeholder="optional" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" id="asEmail" class="form-select" placeholder="optional" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>GST No.</label>
+                <input type="text" id="asGst" class="form-select" placeholder="optional" autocomplete="off" style="text-transform:uppercase;">
+            </div>
+            <div class="form-group">
+                <label>City</label>
+                <input type="text" id="asCity" class="form-select" placeholder="optional" autocomplete="off" style="text-transform:uppercase;">
+            </div>
+            <div class="form-group">
+                <label>State</label>
+                <select id="asState" class="form-select">
+                    <option value="HARYANA (LOCAL)">HARYANA (LOCAL)</option>
+                    <option value="OUT OF STATE">OUT OF STATE</option>
+                </select>
+            </div>
+            <div class="err-banner" id="asError" style="display:none;"></div>
+            <div style="display:flex; gap:8px;">
+                <button class="btn" id="asSaveBtn" style="flex:1; width:auto; background:#16a34a;">Save Supplier</button>
+                <button class="btn" id="asCancelBtn" style="flex:1; width:auto; background:#6c757d;">&#10006; Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ NEW PERSONNEL ITEM REQUIREMENT FORM ═════════════════════════
+         The same PR that STORE.html's "PERSONNEL ITEM REQUIREMENT FORM"
+         raises, laid out for a phone: the desktop's 11-column item table
+         cannot be read at 480px, so each item is its own CARD with its
+         fields stacked, and the request header is a single column instead
+         of two 4-up grids. It writes the same rows (purchase_requirements +
+         purchase_requirement_lines + the pdf_snapshot the Vendor Rate &
+         Info sheet reads), so a PR raised here is indistinguishable from
+         one raised on a desktop.
+
+         Required By Date and Priority both start EMPTY — a date that was
+         pre-filled with "a week from now" and a Priority pre-set to Normal
+         were being submitted unread. Neither can be left blank. -->
+    <div class="modal-overlay" id="prFormModal" style="z-index:1200;">
+        <div class="modal-content">
+            <div class="modal-title">
+                <span>Personnel Item Requirement</span>
+                <button class="close-btn" onclick="closeMobilePrForm()">×</button>
+            </div>
+
+            <div class="pr-sec-head">Request Details</div>
+            <div class="pr-grid2">
+                <div class="form-group">
+                    <label>Date</label>
+                    <input type="date" id="prmDate" class="form-select" readonly style="background:#f1f5f9;">
+                </div>
+                <div class="form-group">
+                    <label>Requirement No.</label>
+                    <input type="text" id="prmReqNo" class="form-select" placeholder="Auto" readonly style="background:#f1f5f9;font-weight:700;color:#0284c7;">
+                </div>
+            </div>
+            <!-- Opens EMPTY, never on today. autocomplete="off" stops the browser
+                 restoring the date typed into the last requirement. -->
+            <div class="form-group">
+                <label>Required By Date <span style="color:#dc3545;">*</span></label>
+                <input type="date" id="prmRequiredBy" class="form-select" value="" autocomplete="off">
+                <div class="pr-hint">Please choose a date; none is filled in by default.</div>
+            </div>
+            <div class="form-group">
+                <label>Priority <span style="color:#dc3545;">*</span></label>
+                <input type="hidden" id="prmPriority" value="">
+                <div class="pr-prio-group" id="prmPriorityGroup">
+                    <button type="button" class="pr-prio-btn" data-priority="Normal">Normal</button>
+                    <button type="button" class="pr-prio-btn" data-priority="Urgent">Urgent</button>
+                    <button type="button" class="pr-prio-btn" data-priority="Critical">Critical</button>
+                </div>
+                <div class="pr-hint">Choose one of the three; there is no default.</div>
+            </div>
+            <!-- A Purchaser logged in here cannot change this: the PR is booked
+                 against whoever is signed in, and the mobile Purchaser lists
+                 filter on this column, so letting one Purchaser book a PR onto
+                 another's name would move work off their own queue. Locked by
+                 prmLockPurchaser_(); only the roles with no Purchaser name of
+                 their own (GM / MD / PO Sender) get to pick. -->
+            <div class="form-group">
+                <label>Purchaser Name <span style="color:#dc3545;">*</span></label>
+                <select id="prmPurchaser" class="form-select">
+                    <option value="">-- Select Purchaser --</option>
+                    <option value="KHUSHBOO">KHUSHBOO</option>
+                    <option value="SATINDER JI">SATINDER JI</option>
+                    <option value="ANKUR JI">ANKUR JI</option>
+                    <option value="PARKASH JI">PARKASH JI</option>
+                    <option value="DEEPAK VERMA">DEEPAK VERMA</option>
+                    <option value="PRIYA VERMA">PRIYA VERMA</option>
+                    <option value="FIELD BOY">FIELD BOY</option>
+                </select>
+                <div class="pr-hint" id="prmPurchaserHint">Filled in from the first item's Category. You can change it.</div>
+            </div>
+
+            <div class="pr-sec-head">Requested By</div>
+            <div class="form-group">
+                <label>Employee Code <span style="color:#dc3545;">*</span></label>
+                <input type="text" id="prmEmpCode" class="form-select" placeholder="e.g. EMP-007"
+                       list="prm-dl-emp-codes" autocomplete="off" style="text-transform:uppercase;">
+                <datalist id="prm-dl-emp-codes"></datalist>
+                <div id="prmEmpDetails" class="pr-emp-box">Enter the Employee Code; Name / Designation / Department / Contact will appear here</div>
+            </div>
+
+            <div class="pr-sec-head">
+                <span>Items Required</span>
+                <span class="pr-totals">
+                    <span id="prmTotItems">0</span> item &middot; Qty <span id="prmTotQty">0</span>
+                </span>
+            </div>
+            <div id="prmItemList"></div>
+            <button type="button" class="btn" id="prmAddItemBtn" style="background:#0284c7;margin-bottom:14px;">Add Item</button>
+
+            <div class="form-group">
+                <label>Overall Remarks <small style="font-weight:500;color:#6b7280;">— optional</small></label>
+                <textarea id="prmRemarks" rows="2" placeholder="Any note about this requirement..."></textarea>
+            </div>
+
+            <div class="err-banner" id="prmError"></div>
+            <div style="display:flex; gap:8px;">
+                <button class="btn" id="prmSubmitBtn" style="flex:1; width:auto;">Submit Requirement</button>
+                <button class="btn" id="prmCancelBtn" style="flex:1; width:auto; background:#6c757d;">&#10006; Cancel</button>
+            </div>
+
+            <!-- Shared pickers for every item card (rebuilt on open from the masters). -->
+            <datalist id="prm-dl-item-names"></datalist>
+            <datalist id="prm-dl-item-makes"></datalist>
+            <datalist id="prm-dl-machines"></datalist>
+        </div>
+    </div>
+</div>
+
+<!-- ?v= is the build stamp. A phone browser keeps its own copy of these two
+     files, so without a new address after an update one phone can go on
+     running the OLD calculation code and show a different PO amount from the
+     next. Change the stamp (here and on mobile.css above) whenever
+     mobile-core.js or mobile.css changes. -->
+<script src="mobile-core.js?v=20261031d"></script>
+<!-- Floating "← Apps" button. The file decides by itself whether to show it (not inside an iframe, and not without a single-login session). See app-back.js. -->
+<script src="app-back.js"></script>
+<!-- Yellow spotlight that follows the mouse (desktop only). See cursor-glow.js. -->
+<script src="cursor-glow.js"></script>
+</body>
+</html>
